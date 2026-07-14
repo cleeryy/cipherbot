@@ -26,7 +26,11 @@ impl Database {
                 delete_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_tracked_delete_at
-                ON tracked_messages(delete_at);",
+                ON tracked_messages(delete_at);
+            CREATE TABLE IF NOT EXISTS channel_threads (
+                channel_id INTEGER PRIMARY KEY,
+                thread_id INTEGER NOT NULL
+            );",
         )?;
         tracing::debug!("Database schema initialized");
         Ok(())
@@ -85,6 +89,48 @@ impl Database {
         )?;
         tracing::debug!("DB: message {} removed from tracking", message_id);
         Ok(())
+    }
+
+    pub fn set_last_thread(&self, channel_id: u64, thread_id: u64) -> anyhow::Result<()> {
+        tracing::debug!("DB: setting last thread for channel {} to {}", channel_id, thread_id);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_threads (channel_id, thread_id) VALUES (?1, ?2)",
+            params![channel_id as i64, thread_id as i64],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn get_last_thread(&self, channel_id: u64) -> anyhow::Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT thread_id FROM channel_threads WHERE channel_id = ?1",
+            params![channel_id as i64],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(id) => Ok(Some(id as u64)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn load_all_last_threads(&self) -> anyhow::Result<Vec<(u64, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT channel_id, thread_id FROM channel_threads")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, i64>(1)? as u64,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        tracing::debug!("DB: loaded {} last_thread entries", result.len());
+        Ok(result)
     }
 
     #[allow(dead_code)]

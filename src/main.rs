@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         | GatewayIntents::MESSAGE_CONTENT
         | GatewayIntents::GUILDS;
 
-    let handler = handler::Handler::new(config.clone());
+    let handler = handler::Handler::new(config.clone(), database.clone());
     let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(handler)
         .await?;

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use linkify::{LinkFinder, LinkKind};
@@ -10,20 +11,23 @@ use serenity::model::prelude::*;
 use serenity::prelude::*;
 
 use crate::config::Config;
+use crate::db::Database;
 
 pub struct Handler {
     pub config: Config,
-    /// Tracks the last thread created per channel (channel_id -> thread_id),
-    /// so non-link messages can be forwarded into the most recent thread.
+    /// Persisted last thread per channel, loaded from DB on start
+    /// and updated whenever a thread is created.
     pub last_threads: Mutex<HashMap<ChannelId, ChannelId>>,
+    pub database: Arc<Database>,
 }
 
 impl Handler {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, database: Arc<Database>) -> Self {
         tracing::debug!("Handler created with {} monitored category(ies)", config.categories.len());
         Handler {
             config,
             last_threads: Mutex::new(HashMap::new()),
+            database,
         }
     }
 
@@ -147,6 +151,9 @@ impl EventHandler for Handler {
                 Ok(thread) => {
                     tracing::info!("[THREAD] ✅ Created '{}' (id={})", thread_name, thread.id);
                     self.last_threads.lock().unwrap().insert(channel.id, thread.id);
+                    if let Err(e) = self.database.set_last_thread(channel.id.get(), thread.id.get()) {
+                        tracing::warn!("Failed to persist last_thread: {}", e);
+                    }
                 }
                 Err(e) => {
                     tracing::error!("[THREAD] ❌ Failed: {}", e);
@@ -186,6 +193,21 @@ impl EventHandler for Handler {
             }
             Err(e) => {
                 tracing::warn!("Failed to fetch guild list: {}", e);
+            }
+        }
+
+        // Load persisted last_thread entries into memory so forwarding
+        // works immediately after a restart.
+        match self.database.load_all_last_threads() {
+            Ok(entries) => {
+                let mut map = self.last_threads.lock().unwrap();
+                for (channel_id, thread_id) in entries {
+                    map.insert(ChannelId::new(channel_id), ChannelId::new(thread_id));
+                }
+                tracing::info!("Loaded {} last-thread mapping(s) from DB", map.len());
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load last_threads from DB: {}", e);
             }
         }
     }
