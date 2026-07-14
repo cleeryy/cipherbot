@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use linkify::{LinkFinder, LinkKind};
-use serenity::all::ChannelType;
+use serenity::all::{ActivityData, ChannelType};
 use serenity::async_trait;
 use serenity::builder::CreateThread;
 use serenity::model::channel::Channel;
@@ -195,6 +195,12 @@ impl EventHandler for Handler {
                 tracing::warn!("Failed to fetch guild list: {}", e);
             }
         }
+
+        ctx.set_presence(
+            Some(ActivityData::watching("for 0-days")),
+            OnlineStatus::Online,
+        );
+        tracing::info!("[PRESENCE] Watching for 0-days");
 
         // Load persisted last_thread entries into memory so forwarding
         // works immediately after a restart.
