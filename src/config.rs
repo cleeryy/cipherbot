@@ -34,6 +34,7 @@ pub struct CategoryConfig {
     #[serde(default = "default_true")]
     pub auto_thread_links: bool,
     #[serde(default = "default_ttl")]
+    #[allow(dead_code)]
     pub message_ttl_hours: u64,
 }
 

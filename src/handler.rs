@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use linkify::{LinkFinder, LinkKind};
 use serenity::all::ChannelType;
 use serenity::async_trait;
@@ -9,17 +7,15 @@ use serenity::model::prelude::*;
 use serenity::prelude::*;
 
 use crate::config::Config;
-use crate::db::Database;
 
 pub struct Handler {
     pub config: Config,
-    pub database: Arc<Database>,
 }
 
 impl Handler {
-    pub fn new(config: Config, database: Arc<Database>) -> Self {
+    pub fn new(config: Config) -> Self {
         tracing::debug!("Handler created with {} monitored category(ies)", config.categories.len());
-        Handler { config, database }
+        Handler { config }
     }
 
     fn is_monitored(&self, channel: &GuildChannel) -> bool {
@@ -144,6 +140,11 @@ impl EventHandler for Handler {
                     if let Err(e) = msg.reply(&ctx.http, format!("Thread: <#{}>", thread.id)).await {
                         tracing::warn!("Failed to reply with thread link: {}", e);
                     }
+                    if let Err(e) = msg.delete(&ctx.http).await {
+                        tracing::warn!("Failed to delete original message {}: {}", msg.id, e);
+                    } else {
+                        tracing::debug!("Deleted original message {} to keep channel clean", msg.id);
+                    }
                 }
                 Err(e) => {
                     tracing::error!("[THREAD] ❌ Failed: {}", e);
@@ -151,20 +152,14 @@ impl EventHandler for Handler {
             }
         } else if !has_link {
             tracing::info!(
-                "[TRACK] No link — scheduling deletion in {}h",
-                cat_config.message_ttl_hours,
+                "[DELETE] No link — deleting message {} from {}",
+                msg.id,
+                channel.name,
             );
-            match self.database.track_message(
-                msg.id.get(),
-                msg.channel_id.get(),
-                cat_config.message_ttl_hours,
-            ) {
-                Ok(_) => {
-                    tracing::info!("[TRACK] ✅ Message {} tracked", msg.id);
-                }
-                Err(e) => {
-                    tracing::error!("[TRACK] ❌ Failed: {}", e);
-                }
+            if let Err(e) = msg.delete(&ctx.http).await {
+                tracing::warn!("[DELETE] Failed to delete message {}: {}", msg.id, e);
+            } else {
+                tracing::debug!("[DELETE] Deleted non-link message {}", msg.id);
             }
         }
     }

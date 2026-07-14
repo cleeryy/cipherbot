@@ -32,6 +32,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn track_message(
         &self,
         message_id: u64,
