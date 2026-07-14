@@ -50,7 +50,13 @@ impl EventHandler for Handler {
 
         let channel = match msg.channel_id.to_channel(&ctx.http).await {
             Ok(Channel::Guild(ch)) => ch,
-            _ => return,
+            Ok(_) => {
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to resolve channel {}: {}", msg.channel_id, e);
+                return;
+            }
         };
 
         if matches!(
@@ -60,7 +66,20 @@ impl EventHandler for Handler {
             return;
         }
 
+        let parent_id = channel.parent_id.map(|id| id.get());
+        tracing::trace!(
+            "Message in channel {} (parent category: {:?}) — monitored categories: {:?}",
+            msg.channel_id,
+            parent_id,
+            self.config.categories.iter().map(|c| c.id).collect::<Vec<_>>()
+        );
+
         if !self.is_monitored(&channel) {
+            tracing::debug!(
+                "Channel {} not in monitored categories (parent: {:?})",
+                msg.channel_id,
+                parent_id
+            );
             return;
         }
 
@@ -69,10 +88,14 @@ impl EventHandler for Handler {
             None => return,
         };
 
+        tracing::debug!("Message content length: {}", msg.content.len());
+
         let finder = LinkFinder::new();
         let has_link = finder
             .links(&msg.content)
             .any(|l| matches!(l.kind(), LinkKind::Url));
+
+        tracing::debug!("Message has_link={}, auto_thread_links={}", has_link, cat_config.auto_thread_links);
 
         if has_link && cat_config.auto_thread_links {
             let thread_name = msg

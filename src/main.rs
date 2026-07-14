@@ -28,8 +28,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     tracing::info!(
-        "Configuration loaded — monitoring {} categorie(s)",
-        config.categories.len()
+        "Configuration loaded — monitoring {} categorie(s): {:?}",
+        config.categories.len(),
+        config.categories.iter().map(|c| c.id).collect::<Vec<_>>()
     );
 
     let database = Arc::new(db::Database::open(&config.database.path)?);
