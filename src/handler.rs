@@ -141,6 +141,9 @@ impl EventHandler for Handler {
             {
                 Ok(thread) => {
                     tracing::info!("[THREAD] ✅ Created '{}' (id={})", thread_name, thread.id);
+                    if let Err(e) = msg.reply(&ctx.http, format!("Thread: <#{}>", thread.id)).await {
+                        tracing::warn!("Failed to reply with thread link: {}", e);
+                    }
                 }
                 Err(e) => {
                     tracing::error!("[THREAD] ❌ Failed: {}", e);
