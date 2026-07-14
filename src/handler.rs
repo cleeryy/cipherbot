@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use linkify::{LinkFinder, LinkKind};
-use serenity::all::{ActivityData, ChannelType};
+use serenity::all::{ActivityData, ActivityType, ChannelType};
 use serenity::async_trait;
 use serenity::builder::CreateThread;
 use serenity::model::channel::Channel;
@@ -197,10 +197,15 @@ impl EventHandler for Handler {
         }
 
         ctx.set_presence(
-            Some(ActivityData::watching("for 0-days")),
+            Some(ActivityData {
+                name: String::new(),
+                kind: ActivityType::Custom,
+                state: Some("🔍 for 0-days".to_string()),
+                url: None,
+            }),
             OnlineStatus::Online,
         );
-        tracing::info!("[PRESENCE] Watching for 0-days");
+        tracing::info!("[PRESENCE] Status set to 🔍 for 0-days");
 
         // Load persisted last_thread entries into memory so forwarding
         // works immediately after a restart.
