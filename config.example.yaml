@@ -1,0 +1,11 @@
+discord_token: ""  # can also be set via DISCORD_TOKEN env var
+
+database:
+  path: "cipherbot.db"  # can also be set via DATABASE_PATH env var
+
+categories:
+  # Add your Discord category IDs here
+  # Can also be set via MONITORED_CATEGORIES env var: "123456789,987654321"
+  - id: 0
+    auto_thread_links: true
+    message_ttl_hours: 24
