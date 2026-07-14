@@ -164,7 +164,7 @@ impl EventHandler for Handler {
             let thread_id = self.last_threads.lock().unwrap().get(&channel.id).copied();
             if let Some(thread_id) = thread_id {
                 tracing::info!("[FORWARD] Forwarding msg {} to thread {} in '{}'", msg.id, thread_id, channel.name);
-                let forwarded = format!("{} {}", msg.author.mention(), msg.content);
+                let forwarded = format!("> {} {}", msg.author.mention(), msg.content);
                 if let Err(e) = thread_id.say(&ctx.http, &forwarded).await {
                     tracing::warn!("[FORWARD] Failed to send to thread {}: {}", thread_id, e);
                 }
