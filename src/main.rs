@@ -20,7 +20,13 @@ async fn main() -> anyhow::Result<()> {
 
     dotenvy::dotenv().ok();
 
-    let config = config::Config::load()?;
+    let config = match config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[FATAL] Configuration error: {e}");
+            std::process::exit(1);
+        }
+    };
     tracing::info!(
         "Configuration loaded — monitoring {} categorie(s)",
         config.categories.len()

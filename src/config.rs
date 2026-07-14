@@ -54,10 +54,12 @@ impl Config {
             let content = std::fs::read_to_string(&config_path)?;
             serde_yaml::from_str(&content)?
         } else {
-            anyhow::bail!(
-                "Config file not found at '{}'. Create one or set CONFIG_PATH env var.",
-                config_path
-            );
+            tracing::debug!("No config file at '{}', using defaults + env vars", config_path);
+            Config {
+                discord_token: String::new(),
+                database: DatabaseConfig::default(),
+                categories: Vec::new(),
+            }
         };
 
         if let Ok(token) = std::env::var("DISCORD_TOKEN") {
@@ -84,13 +86,15 @@ impl Config {
         }
 
         if config.discord_token.is_empty() {
-            anyhow::bail!("DISCORD_TOKEN is not set");
+            anyhow::bail!(
+                "DISCORD_TOKEN is not set. Provide it via DISCORD_TOKEN env var \
+                 or in the config.yaml file."
+            );
         }
-
         if config.categories.is_empty() {
             anyhow::bail!(
-                "No categories configured. Add at least one category ID in config.yaml \
-                 or set MONITORED_CATEGORIES env var (e.g. MONITORED_CATEGORIES=\"123456789\")"
+                "No categories configured. Set MONITORED_CATEGORIES env var \
+                 (e.g. MONITORED_CATEGORIES=\"123456789\") or add them in config.yaml."
             );
         }
 
