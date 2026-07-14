@@ -137,14 +137,6 @@ impl EventHandler for Handler {
             {
                 Ok(thread) => {
                     tracing::info!("[THREAD] ✅ Created '{}' (id={})", thread_name, thread.id);
-                    if let Err(e) = msg.reply(&ctx.http, format!("Thread: <#{}>", thread.id)).await {
-                        tracing::warn!("Failed to reply with thread link: {}", e);
-                    }
-                    if let Err(e) = msg.delete(&ctx.http).await {
-                        tracing::warn!("Failed to delete original message {}: {}", msg.id, e);
-                    } else {
-                        tracing::debug!("Deleted original message {} to keep channel clean", msg.id);
-                    }
                 }
                 Err(e) => {
                     tracing::error!("[THREAD] ❌ Failed: {}", e);
