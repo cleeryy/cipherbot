@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use linkify::{LinkFinder, LinkKind};
 use serenity::all::ChannelType;
 use serenity::async_trait;
@@ -10,12 +13,18 @@ use crate::config::Config;
 
 pub struct Handler {
     pub config: Config,
+    /// Tracks the last thread created per channel (channel_id -> thread_id),
+    /// so non-link messages can be forwarded into the most recent thread.
+    pub last_threads: Mutex<HashMap<ChannelId, ChannelId>>,
 }
 
 impl Handler {
     pub fn new(config: Config) -> Self {
         tracing::debug!("Handler created with {} monitored category(ies)", config.categories.len());
-        Handler { config }
+        Handler {
+            config,
+            last_threads: Mutex::new(HashMap::new()),
+        }
     }
 
     fn is_monitored(&self, channel: &GuildChannel) -> bool {
@@ -137,17 +146,26 @@ impl EventHandler for Handler {
             {
                 Ok(thread) => {
                     tracing::info!("[THREAD] ✅ Created '{}' (id={})", thread_name, thread.id);
+                    self.last_threads.lock().unwrap().insert(channel.id, thread.id);
                 }
                 Err(e) => {
                     tracing::error!("[THREAD] ❌ Failed: {}", e);
                 }
             }
         } else if !has_link {
-            tracing::info!(
-                "[DELETE] No link — deleting message {} from {}",
-                msg.id,
-                channel.name,
-            );
+            // Forward to the last thread created in this channel, if any
+            let thread_id = self.last_threads.lock().unwrap().get(&channel.id).copied();
+            if let Some(thread_id) = thread_id {
+                tracing::info!("[FORWARD] Forwarding msg {} to thread {} in '{}'", msg.id, thread_id, channel.name);
+                let forwarded = format!("**{}:** {}", msg.author.name, msg.content);
+                if let Err(e) = thread_id.say(&ctx.http, &forwarded).await {
+                    tracing::warn!("[FORWARD] Failed to send to thread {}: {}", thread_id, e);
+                }
+            } else {
+                tracing::debug!("[FORWARD] No last thread for channel '{}', skipping forward", channel.name);
+            }
+
+            tracing::info!("[DELETE] Deleting non-link message {} from '{}'", msg.id, channel.name);
             if let Err(e) = msg.delete(&ctx.http).await {
                 tracing::warn!("[DELETE] Failed to delete message {}: {}", msg.id, e);
             } else {
