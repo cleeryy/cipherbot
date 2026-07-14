@@ -196,16 +196,50 @@ impl EventHandler for Handler {
             }
         }
 
+        const STATUSES: &[&str] = &[
+            "🔍 scanning ports",
+            "🛡️ bypassing firewall",
+            "💀 escalating privileges",
+            "📡 sniffing packets",
+            "🔓 cracking hashes",
+            "🌐 tracing routes",
+            "🎯 exploiting vectors",
+        ];
+
+        let status = STATUSES[0];
         ctx.set_presence(
             Some(ActivityData {
                 name: String::new(),
                 kind: ActivityType::Custom,
-                state: Some("🔍 for 0-days".to_string()),
+                state: Some(status.to_string()),
                 url: None,
             }),
             OnlineStatus::Online,
         );
-        tracing::info!("[PRESENCE] Status set to 🔍 for 0-days");
+        tracing::info!("[PRESENCE] Status set to \"{}\"", status);
+
+        // Rotate through statuses every hour
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.tick().await; // skip first immediate tick
+            let mut i = 1usize;
+            loop {
+                interval.tick().await;
+                let status = STATUSES[i % STATUSES.len()];
+                ctx.set_presence(
+                    Some(ActivityData {
+                        name: String::new(),
+                        kind: ActivityType::Custom,
+                        state: Some(status.to_string()),
+                        url: None,
+                    }),
+                    OnlineStatus::Online,
+                );
+                tracing::debug!("[PRESENCE] Status rotated to \"{}\"", status);
+                i += 1;
+            }
+        });
 
         // Load persisted last_thread entries into memory so forwarding
         // works immediately after a restart.
