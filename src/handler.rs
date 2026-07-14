@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use linkify::{LinkFinder, LinkKind};
 use serenity::all::ChannelType;
+use serenity::all::ReactionType;
 use serenity::async_trait;
 use serenity::builder::CreateThread;
 use serenity::model::channel::Channel;
@@ -24,75 +25,51 @@ impl Handler {
 
     fn is_monitored(&self, channel: &GuildChannel) -> bool {
         let Some(parent_id) = channel.parent_id else {
-            tracing::trace!("Channel {} has no parent category", channel.id);
             return false;
         };
-        let matched = self
-            .config
+        self.config
             .categories
             .iter()
-            .any(|cat| cat.id == parent_id.get());
-
-        tracing::trace!(
-            "is_monitored: channel {} parent={}, matched={}",
-            channel.id,
-            parent_id.get(),
-            matched
-        );
-        matched
+            .any(|cat| cat.id == parent_id.get())
     }
 
     fn category_config(&self, channel: &GuildChannel) -> Option<crate::config::CategoryConfig> {
         let parent_id = channel.parent_id?;
-        let result = self
-            .config
+        self.config
             .categories
             .iter()
             .find(|cat| cat.id == parent_id.get())
-            .cloned();
-        tracing::trace!("category_config for channel {} (parent={}): {:?}", channel.id, parent_id.get(), result.as_ref().map(|c| c.id));
-        result
+            .cloned()
+    }
+
+    async fn try_react(&self, msg: &Message, ctx: &Context, emoji: &str) {
+        match msg.react(ctx, ReactionType::Unicode(emoji.to_string())).await {
+            Ok(_) => tracing::debug!("Reacted with '{}' on {}", emoji, msg.id),
+            Err(e) => tracing::warn!("Failed to react with '{}' on {}: {}", emoji, msg.id, e),
+        }
     }
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
-        tracing::info!(
-            "[MESSAGE] Received from {} in channel {} | content(len={}): {:?}",
-            msg.author.name,
-            msg.channel_id,
-            msg.content.len(),
-            msg.content.chars().take(120).collect::<String>(),
-        );
-
         if msg.author.bot {
-            tracing::debug!("Skipping bot message from {}", msg.author.name);
             return;
         }
 
-        if let Some(guild_id) = msg.guild_id {
-            if let Some(guild) = ctx.cache.guild(guild_id) {
-                tracing::debug!("Message guild: '{}' ({}), channel_id: {}", guild.name, guild_id, msg.channel_id);
-            } else {
-                tracing::debug!("Message guild {} not in cache", guild_id);
-            }
-        } else {
-            tracing::debug!("Message has no guild (likely DM)");
-        }
+        tracing::info!(
+            "[MESSAGE] author={} channel={} guild={:?} content(len={})={:?}",
+            msg.author.name,
+            msg.channel_id,
+            msg.guild_id,
+            msg.content.len(),
+            msg.content.chars().take(150).collect::<String>(),
+        );
 
         let channel = match msg.channel_id.to_channel(&ctx.http).await {
-            Ok(Channel::Guild(ch)) => {
-                tracing::debug!(
-                    "Resolved as guild channel: '{}' (kind={:?}, parent={:?})",
-                    ch.name,
-                    ch.kind,
-                    ch.parent_id.map(|id| id.get())
-                );
-                ch
-            }
+            Ok(Channel::Guild(ch)) => ch,
             Ok(_) => {
-                tracing::debug!("Message not in a guild channel, skipping");
+                tracing::debug!("Non-guild channel, skipping");
                 return;
             }
             Err(e) => {
@@ -105,14 +82,15 @@ impl EventHandler for Handler {
             channel.kind,
             ChannelType::PublicThread | ChannelType::PrivateThread
         ) {
-            tracing::debug!("Message is inside a thread, skipping");
+            tracing::debug!("Message in thread, skipping");
             return;
         }
 
         let parent_id = channel.parent_id.map(|id| id.get());
         let monitored_ids: Vec<u64> = self.config.categories.iter().map(|c| c.id).collect();
+
         tracing::info!(
-            "[CHECK] Channel '{}' ({}) — parent category: {:?} — monitored categories: {:?}",
+            "[CHECK] channel='{}' ({}) parent={:?} monitored={:?}",
             channel.name,
             channel.id,
             parent_id,
@@ -120,35 +98,18 @@ impl EventHandler for Handler {
         );
 
         if !self.is_monitored(&channel) {
-            tracing::info!(
-                "[SKIP] Channel '{}' is NOT in any monitored category (parent={:?}, monitored={:?})",
-                channel.name,
-                parent_id,
-                monitored_ids,
-            );
+            tracing::info!("[SKIP] '{}' not in monitored categories", channel.name);
             return;
         }
 
-        tracing::info!(
-            "[IN SCOPE] Channel '{}' IS in monitored category {:?}",
-            channel.name,
-            parent_id,
-        );
+        tracing::info!("[IN] '{}' — processing message", channel.name);
+
+        self.try_react(&msg, &ctx, "👀").await;
 
         let cat_config = match self.category_config(&channel) {
             Some(c) => c,
-            None => {
-                tracing::warn!("category_config returned None despite is_monitored passing — this should not happen");
-                return;
-            }
+            None => return,
         };
-
-        tracing::info!(
-            "[PROCESSING] Message from {} in '{}': {:?}",
-            msg.author.name,
-            channel.name,
-            msg.content.chars().take(150).collect::<String>(),
-        );
 
         let finder = LinkFinder::new();
         let links: Vec<String> = finder
@@ -158,12 +119,7 @@ impl EventHandler for Handler {
             .collect();
 
         let has_link = !links.is_empty();
-        tracing::info!(
-            "[LINK CHECK] has_link={}, found {} URL(s): {:?}",
-            has_link,
-            links.len(),
-            links,
-        );
+        tracing::info!("[LINKS] has_link={} urls={:?}", has_link, links);
 
         if has_link && cat_config.auto_thread_links {
             let thread_name = msg
@@ -174,7 +130,6 @@ impl EventHandler for Handler {
                 .replace('\n', " ")
                 .trim()
                 .to_string();
-
             let thread_name = if thread_name.is_empty() {
                 "Lien".to_string()
             } else {
@@ -182,11 +137,10 @@ impl EventHandler for Handler {
             };
 
             tracing::info!(
-                "[THREAD] Attempting to create thread '{}' from message {} in channel '{}' ({})...",
+                "[THREAD] Creating '{}' from msg {} in '{}'",
                 thread_name,
                 msg.id,
                 channel.name,
-                channel.id,
             );
 
             match msg
@@ -195,57 +149,38 @@ impl EventHandler for Handler {
                 .await
             {
                 Ok(thread) => {
-                    tracing::info!(
-                        "[THREAD] SUCCESS: Created thread '{}' (id={}) from message {} in channel '{}' ({})",
-                        thread_name,
-                        thread.id,
-                        msg.id,
-                        channel.name,
-                        channel.id,
-                    );
+                    tracing::info!("[THREAD] ✅ Created '{}' (id={})", thread_name, thread.id);
+                    self.try_react(&msg, &ctx, "✅").await;
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "[THREAD] FAILED to create thread for message {} in channel '{}' ({}): {}",
-                        msg.id,
-                        channel.name,
-                        channel.id,
-                        e,
-                    );
-                    tracing::error!(
-                        "[THREAD] This is likely a permissions issue — the bot needs 'Create Threads' and 'Send Messages in Threads' permissions in channel '{}'",
-                        channel.name,
-                    );
+                    tracing::error!("[THREAD] ❌ Failed: {}", e);
+                    self.try_react(&msg, &ctx, "❌").await;
                 }
             }
         } else if !has_link {
             tracing::info!(
-                "[TRACK] Message {} has no link — tracking for deletion in {}h",
-                msg.id,
+                "[TRACK] No link — scheduling deletion in {}h",
                 cat_config.message_ttl_hours,
             );
-            if let Err(e) = self.database.track_message(
+            match self.database.track_message(
                 msg.id.get(),
                 msg.channel_id.get(),
                 cat_config.message_ttl_hours,
             ) {
-                tracing::error!("[TRACK] FAILED to track message {}: {}", msg.id, e);
-            } else {
-                tracing::info!(
-                    "[TRACK] SUCCESS: Message {} will be deleted in {}h",
-                    msg.id,
-                    cat_config.message_ttl_hours,
-                );
+                Ok(_) => {
+                    tracing::info!("[TRACK] ✅ Message {} tracked", msg.id);
+                    self.try_react(&msg, &ctx, "⏳").await;
+                }
+                Err(e) => {
+                    tracing::error!("[TRACK] ❌ Failed: {}", e);
+                    self.try_react(&msg, &ctx, "❌").await;
+                }
             }
-        } else {
-            tracing::debug!(
-                "Message has link but auto_thread_links is disabled for this category"
-            );
         }
     }
 
-    async fn ready(&self, ctx: Context, data_about_bot: Ready) {
-        tracing::info!("{} is connected!", data_about_bot.user.name);
+    async fn ready(&self, ctx: Context, _data_about_bot: Ready) {
+        tracing::info!("cipherbot is connected!");
 
         match ctx.http.get_guilds(None, None).await {
             Ok(guilds) => {
