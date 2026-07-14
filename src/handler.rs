@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use linkify::{LinkFinder, LinkKind};
 use serenity::all::ChannelType;
-use serenity::all::ReactionType;
 use serenity::async_trait;
 use serenity::builder::CreateThread;
 use serenity::model::channel::Channel;
@@ -42,12 +41,6 @@ impl Handler {
             .cloned()
     }
 
-    async fn try_react(&self, msg: &Message, ctx: &Context, emoji: &str) {
-        match msg.react(ctx, ReactionType::Unicode(emoji.to_string())).await {
-            Ok(_) => tracing::debug!("Reacted with '{}' on {}", emoji, msg.id),
-            Err(e) => tracing::warn!("Failed to react with '{}' on {}: {}", emoji, msg.id, e),
-        }
-    }
 }
 
 #[async_trait]
@@ -104,8 +97,6 @@ impl EventHandler for Handler {
 
         tracing::info!("[IN] '{}' — processing message", channel.name);
 
-        self.try_react(&msg, &ctx, "👀").await;
-
         let cat_config = match self.category_config(&channel) {
             Some(c) => c,
             None => return,
@@ -150,11 +141,9 @@ impl EventHandler for Handler {
             {
                 Ok(thread) => {
                     tracing::info!("[THREAD] ✅ Created '{}' (id={})", thread_name, thread.id);
-                    self.try_react(&msg, &ctx, "✅").await;
                 }
                 Err(e) => {
                     tracing::error!("[THREAD] ❌ Failed: {}", e);
-                    self.try_react(&msg, &ctx, "❌").await;
                 }
             }
         } else if !has_link {
@@ -169,11 +158,9 @@ impl EventHandler for Handler {
             ) {
                 Ok(_) => {
                     tracing::info!("[TRACK] ✅ Message {} tracked", msg.id);
-                    self.try_react(&msg, &ctx, "⏳").await;
                 }
                 Err(e) => {
                     tracing::error!("[TRACK] ❌ Failed: {}", e);
-                    self.try_react(&msg, &ctx, "❌").await;
                 }
             }
         }
