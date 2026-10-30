@@ -22,10 +22,59 @@ pub mod evidence;
 pub mod guild;
 pub mod intel;
 pub mod links;
+pub mod poll;
+pub mod tag;
+pub mod ticket;
 pub mod users;
 
 #[allow(unused_imports)]
 pub use guild::GuildSettings;
+
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS tags (
+    guild_id   INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    created_by INTEGER NOT NULL,
+    uses       INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS polls (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    message_id  INTEGER,
+    author_id   INTEGER NOT NULL,
+    question    TEXT NOT NULL,
+    options_json TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    closed_at   INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS poll_votes (
+    poll_id    INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    choice     INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (poll_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS tickets (
+    thread_id  INTEGER PRIMARY KEY,
+    guild_id   INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'open',
+    created_at INTEGER NOT NULL,
+    closed_by  INTEGER,
+    closed_at  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_polls_guild ON polls(guild_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tickets_guild ON tickets(guild_id, user_id);
+"#;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS guild_config (
@@ -219,6 +268,13 @@ impl Database {
         if version < 1 {
             conn.pragma_update(None, "user_version", 1)?;
             tracing::info!("Database migrated to schema v1");
+        }
+
+        if version < 2 {
+            conn.execute_batch(SCHEMA_V2)
+                .context("applying schema v2")?;
+            conn.pragma_update(None, "user_version", 2)?;
+            tracing::info!("Database migrated to schema v2");
         } else {
             tracing::debug!("Database schema already at v{version}");
         }
@@ -261,7 +317,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
 
         for table in [
             "guild_config",
@@ -276,6 +332,10 @@ mod tests {
             "suggestions",
             "suggestion_votes",
             "evidence",
+            "tags",
+            "polls",
+            "poll_votes",
+            "tickets",
             "tracked_messages",
             "channel_threads",
         ] {

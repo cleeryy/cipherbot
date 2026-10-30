@@ -13,12 +13,12 @@ use anyhow::{Result as AnyResult, bail};
 use regex::Regex;
 use serenity::all::{
     CommandDataOption, CommandInteraction, CommandOptionType, Context, CreateCommand,
-    CreateCommandOption, CreateEmbed,
+    CreateCommandOption, CreateEmbed, CreateEmbedFooter,
 };
 
 use crate::bot::{BotResult, SharedState};
 use crate::content;
-use crate::services::{ipinfo, nvd, rdap, vt};
+use crate::services::{dns, ipinfo, nvd, rdap, vt};
 use crate::util::{embeds, opts, respond, text, time};
 
 const INTEL_COOLDOWN_SECS: i64 = 4;
@@ -155,6 +155,36 @@ pub fn commands() -> Vec<CreateCommand> {
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::SubCommand,
+                    "dns",
+                    "Resolve DNS records (A, AAAA, MX, TXT, NS, CNAME, SOA)",
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "name",
+                        "Domain without scheme, e.g. example.com",
+                    )
+                    .required(true)
+                    .max_length(253),
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "type",
+                        "Record type (default: A)",
+                    )
+                    .add_string_choice("A", "A")
+                    .add_string_choice("AAAA", "AAAA")
+                    .add_string_choice("MX", "MX")
+                    .add_string_choice("TXT", "TXT")
+                    .add_string_choice("NS", "NS")
+                    .add_string_choice("CNAME", "CNAME")
+                    .add_string_choice("SOA", "SOA"),
+                ),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
                     "domain",
                     "RDAP registration data for a domain",
                 )
@@ -223,7 +253,7 @@ pub async fn handle(state: &SharedState, ctx: &Context, cmd: &CommandInteraction
 
     if matches!(
         name,
-        "cve" | "cve-latest" | "cve-search" | "ip" | "domain" | "vt"
+        "cve" | "cve-latest" | "cve-search" | "ip" | "dns" | "domain" | "vt"
     ) && let Some(remaining) = check_cooldown(cmd.user.id.get())
     {
         return respond::error(ctx, cmd, format!("Slow down — try again in {remaining}s.")).await;
@@ -235,6 +265,7 @@ pub async fn handle(state: &SharedState, ctx: &Context, cmd: &CommandInteraction
         "cve-search" => cve_search(state, ctx, cmd, args).await,
         "mitre" => mitre(ctx, cmd, args).await,
         "ip" => ip_intel(state, ctx, cmd, args).await,
+        "dns" => dns_intel(state, ctx, cmd, args).await,
         "domain" => domain_intel(state, ctx, cmd, args).await,
         "hash" => hash_intel(state, ctx, cmd, args).await,
         "vt" => vt_intel(state, ctx, cmd, args).await,
@@ -375,6 +406,53 @@ async fn ip_intel(
     }
 
     respond::edit(ctx, cmd, ip_embed(&address, info.as_ref(), record.as_ref())).await
+}
+
+async fn dns_intel(
+    state: &SharedState,
+    ctx: &Context,
+    cmd: &CommandInteraction,
+    args: &[CommandDataOption],
+) -> BotResult<()> {
+    let raw = match opts::req_str(args, "name") {
+        Ok(raw) => raw.trim().to_owned(),
+        Err(error) => return respond::error(ctx, cmd, error).await,
+    };
+
+    if IpAddr::from_str(&raw).is_ok() {
+        return respond::error(
+            ctx,
+            cmd,
+            format!(
+                "`{}` is an IP address — use `/intel ip` instead.",
+                text::truncate(&raw, 80)
+            ),
+        )
+        .await;
+    }
+
+    let Some(name) = dns::normalize_name(&raw) else {
+        return respond::error(
+            ctx,
+            cmd,
+            format!(
+                "`{}` is not a valid domain name — send a bare hostname without scheme or path.",
+                text::truncate(&raw, 80)
+            ),
+        )
+        .await;
+    };
+
+    let rtype = opts::opt_str(args, "type")
+        .and_then(dns::RecordType::parse)
+        .unwrap_or(dns::RecordType::A);
+
+    respond::working(ctx, cmd, format!("Resolving {} {}…", name, rtype.as_str())).await?;
+
+    match dns::lookup(state, &name, rtype).await {
+        Ok(lookup) => respond::edit(ctx, cmd, dns_embed(&name, rtype, &lookup)).await,
+        Err(error) => respond::error(ctx, cmd, error).await,
+    }
 }
 
 async fn domain_intel(
@@ -780,6 +858,89 @@ fn ip_embed(
     embeds::footer(embed)
 }
 
+/// Rows per embed before the record list is cut off.
+const MAX_DNS_ROWS: usize = 20;
+
+fn dns_embed(name: &str, rtype: dns::RecordType, lookup: &dns::DnsLookup) -> CreateEmbed {
+    let colour = match lookup.status {
+        0 => embeds::brand(),
+        3 => embeds::AMBER,
+        _ => embeds::RED,
+    };
+
+    let mut embed = CreateEmbed::new()
+        .title(format!("DNS — {name} ({})", rtype.as_str()))
+        .colour(colour)
+        .field("Status", dns::status_label(lookup.status), true)
+        .field("Answers", lookup.answers.len().to_string(), true);
+
+    if lookup.answers.is_empty() {
+        embed = embed.description(format!("**No records.** {}", no_answer_text(lookup.status)));
+    } else {
+        let rows = lookup
+            .answers
+            .iter()
+            .take(MAX_DNS_ROWS)
+            .map(record_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        embed = embed.description(format!("```\n{}\n```", text::truncate(&rows, 3500)));
+    }
+
+    if !lookup.authority.is_empty() {
+        let rows = lookup
+            .authority
+            .iter()
+            .take(3)
+            .map(record_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        embed = embed.field(
+            "Authority",
+            format!("```\n{}\n```", text::truncate(&rows, 1000)),
+            false,
+        );
+    }
+
+    embed.footer(CreateEmbedFooter::new(format!(
+        "via Cloudflare DoH · CipherBot v{}",
+        env!("CARGO_PKG_VERSION")
+    )))
+}
+
+/// One `name TTL type data` row. Data is escaped for a markdown code block:
+/// backticks become apostrophes and control characters become spaces.
+fn record_line(answer: &dns::DnsAnswer) -> String {
+    format!(
+        "{} {} {} {}",
+        text::truncate(&code_cell(&answer.name), 100),
+        answer.ttl,
+        dns::type_name(answer.rtype),
+        text::truncate(&code_cell(&answer.data), 160),
+    )
+}
+
+fn code_cell(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| match ch {
+            '`' => '\'',
+            ch if ch.is_control() => ' ',
+            ch => ch,
+        })
+        .collect()
+}
+
+fn no_answer_text(status: i32) -> &'static str {
+    match status {
+        0 => "The name exists, but the resolver returned no records of this type.",
+        3 => "The name does not exist (NXDOMAIN).",
+        2 => "The resolver failed to answer (SERVFAIL), so the result is unknown.",
+        5 => "The resolver refused the query (REFUSED).",
+        _ => "The resolver returned no answers for this query.",
+    }
+}
+
 fn domain_embed(record: &rdap::RdapDomain) -> CreateEmbed {
     let mut embed = CreateEmbed::new()
         .title(format!("Domain intel — {}", record.domain))
@@ -962,5 +1123,95 @@ mod tests {
         let embed = mitre_embed("T1059").expect("known technique");
         let _ = embed;
         assert!(mitre_embed("definitely-not-a-technique").is_err());
+    }
+
+    fn answer(name: &str, rtype: u16, ttl: u32, data: &str) -> dns::DnsAnswer {
+        dns::DnsAnswer {
+            name: name.to_owned(),
+            rtype,
+            ttl,
+            data: data.to_owned(),
+        }
+    }
+
+    #[test]
+    fn dns_embed_lists_answers() {
+        let lookup = dns::DnsLookup {
+            status: 0,
+            answers: vec![
+                answer("example.com.", 1, 300, "93.184.216.34"),
+                answer("example.com.", 15, 3600, "10 mail.example.com."),
+                answer("example.com.", 16, 60, "\"v=spf1 -all\""),
+            ],
+            authority: Vec::new(),
+        };
+        let embed = dns_embed("example.com", dns::RecordType::A, &lookup);
+        let value = serde_json::to_value(&embed).expect("embed serialises");
+
+        let description = value["description"].as_str().expect("description");
+        assert!(description.contains("93.184.216.34"));
+        assert!(description.contains("10 mail.example.com."));
+        assert!(description.contains("\"v=spf1 -all\""));
+        assert!(description.contains("A "));
+        assert!(description.contains("MX"));
+        assert!(description.contains("TXT"));
+        assert_eq!(value["title"], "DNS — example.com (A)");
+        assert!(
+            value["footer"]["text"]
+                .as_str()
+                .expect("footer")
+                .contains("Cloudflare DoH")
+        );
+    }
+
+    #[test]
+    fn dns_embed_handles_empty_answers() {
+        let lookup = dns::DnsLookup {
+            status: 3,
+            answers: Vec::new(),
+            authority: vec![answer(
+                "com.",
+                6,
+                900,
+                "a.gtld-servers.net. nstld.verisign-grs.com. 1 1800 900 604800 86400",
+            )],
+        };
+        let embed = dns_embed("does-not-exist.example", dns::RecordType::Aaaa, &lookup);
+        let value = serde_json::to_value(&embed).expect("embed serialises");
+
+        let description = value["description"].as_str().expect("description");
+        assert!(description.contains("No records"));
+        assert!(description.contains("NXDOMAIN"));
+        assert_eq!(value["title"], "DNS — does-not-exist.example (AAAA)");
+        assert!(
+            value["fields"]
+                .as_array()
+                .expect("fields")
+                .iter()
+                .any(|field| field["name"] == "Authority")
+        );
+    }
+
+    #[test]
+    fn dns_embed_sanitises_code_block() {
+        let lookup = dns::DnsLookup {
+            status: 0,
+            answers: vec![answer(
+                "txt.example.com.",
+                16,
+                60,
+                "v=spf1 `broken` fence\nnext-line",
+            )],
+            authority: Vec::new(),
+        };
+        let embed = dns_embed("txt.example.com", dns::RecordType::Txt, &lookup);
+        let value = serde_json::to_value(&embed).expect("embed serialises");
+        let description = value["description"].as_str().expect("description");
+
+        assert!(description.starts_with("```\n"));
+        assert!(description.ends_with("\n```"));
+        assert_eq!(description.matches("```").count(), 2);
+        assert!(description.contains("v=spf1 'broken' fence next-line"));
+        assert!(!description.contains("broken`"));
     }
 }

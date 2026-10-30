@@ -8,7 +8,7 @@ use serenity::all::{
 };
 
 use crate::bot::{BotResult, SharedState};
-use crate::commands::{community, ctf, learning, moderation};
+use crate::commands::{community, ctf, learning, moderation, poll, start, ticket};
 
 pub async fn dispatch(
     state: &SharedState,
@@ -25,6 +25,12 @@ pub async fn dispatch(
         community::handle_component(state, ctx, ci).await?
     } else if custom_id.starts_with("ctf:") {
         ctf::handle_component(state, ctx, ci).await?
+    } else if custom_id.starts_with("start:") {
+        start::handle_component(state, ctx, ci).await?
+    } else if custom_id.starts_with("poll:") {
+        poll::handle_component(state, ctx, ci).await?
+    } else if custom_id.starts_with("ticket:") {
+        ticket::handle_component(state, ctx, ci).await?
     } else {
         false
     };

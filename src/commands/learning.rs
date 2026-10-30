@@ -189,7 +189,7 @@ async fn glossary_command(
             false,
         );
     }
-    respond::public(ctx, cmd, embed).await
+    respond::ephemeral(ctx, cmd, embed).await
 }
 
 async fn roadmap_command(
@@ -229,7 +229,7 @@ async fn roadmap_command(
             false,
         );
     }
-    respond::public(ctx, cmd, embed).await
+    respond::ephemeral(ctx, cmd, embed).await
 }
 
 async fn resources_command(
@@ -277,14 +277,14 @@ async fn resources_command(
             false,
         );
     }
-    respond::public(ctx, cmd, embed).await
+    respond::ephemeral(ctx, cmd, embed).await
 }
 
 async fn tip_command(ctx: &Context, cmd: &CommandInteraction) -> BotResult<()> {
     let tip = content::tip_of_day(utc_day());
     let embed =
         embeds::ok("Tip of the day", tip.text).field("Category", tip.category.label(), true);
-    respond::public(ctx, cmd, embed).await
+    respond::ephemeral(ctx, cmd, embed).await
 }
 
 /// Buttons answer through [`handle_component`].

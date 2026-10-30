@@ -188,6 +188,7 @@ fn config_key_option() -> CreateCommandOption {
         .add_string_choice("Digest channel", "digest_channel")
         .add_string_choice("Quarantine role", "quarantine_role")
         .add_string_choice("Verify role", "verify_role")
+        .add_string_choice("Ticket staff role", "ticket_role")
         .add_string_choice("Link TTL (hours)", "link_ttl_hours")
         .add_string_choice("Auto-thread links", "auto_thread")
         .add_string_choice(
@@ -722,6 +723,7 @@ enum ConfigKey {
     DigestChannel,
     QuarantineRole,
     VerifyRole,
+    TicketRole,
     LinkTtlHours,
     AutoThread,
     RaidMinAgeHours,
@@ -735,6 +737,7 @@ fn parse_config_key(raw: &str) -> Option<ConfigKey> {
         "digest_channel" => Some(ConfigKey::DigestChannel),
         "quarantine_role" => Some(ConfigKey::QuarantineRole),
         "verify_role" => Some(ConfigKey::VerifyRole),
+        "ticket_role" => Some(ConfigKey::TicketRole),
         "link_ttl_hours" => Some(ConfigKey::LinkTtlHours),
         "auto_thread" => Some(ConfigKey::AutoThread),
         "raid_min_account_age_hours" => Some(ConfigKey::RaidMinAgeHours),
@@ -796,6 +799,11 @@ fn apply_config_value(
             let id = parse_snowflake(raw).ok_or_else(|| anyhow::anyhow!("Expected a role ID."))?;
             settings.verify_role = Some(id);
             Ok(format!("verify_role = `{id}`"))
+        }
+        ConfigKey::TicketRole => {
+            let id = parse_snowflake(raw).ok_or_else(|| anyhow::anyhow!("Expected a role ID."))?;
+            settings.ticket_role = Some(id);
+            Ok(format!("ticket_role = `{id}`"))
         }
         ConfigKey::LinkTtlHours => {
             let hours: u64 = raw
@@ -907,6 +915,7 @@ fn settings_summary(settings: &GuildSettings) -> String {
          **Digest channel:** {}\n\
          **Quarantine role:** {}\n\
          **Verify role:** {}\n\
+         **Ticket role:** {}\n\
          **Automod:** invites {}, phishing {}, mass mentions {}, duplicate spam {}, caps {}, token leaks {}\n\
          **Anti-raid:** {}, minimum account age {}h, require avatar {}\n\
          **Links:** auto-thread {}, TTL {}h",
@@ -915,6 +924,7 @@ fn settings_summary(settings: &GuildSettings) -> String {
         channel(settings.digest_channel),
         role(settings.quarantine_role),
         role(settings.verify_role),
+        role(settings.ticket_role),
         flag(settings.automod.invites),
         flag(settings.automod.phishing),
         flag(settings.automod.mass_mentions),

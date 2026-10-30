@@ -22,8 +22,9 @@ One process handles all guilds. There is no sharding in v1 and no horizontal sca
 3. **Privileged intents**
    - *Message Content Intent*: **required** (commands and automod read message content).
    - *Server Members Intent*: **only** if `ENABLE_MEMBER_INTENT=true` (anti-raid join gate). Enabling the intent without the env flag is harmless but unnecessary.
-4. **Invite** — OAuth2 URL Generator, scopes `bot` + `applications.commands`, permissions `1428345154582` (see the README table). Missing `applications.commands` means no slash commands, even if the bot is online.
+4. **Invite** — OAuth2 URL Generator, scopes `bot` + `applications.commands`, permissions `1497064631318` (see the README table). Missing `applications.commands` means no slash commands, even if the bot is online. The integer includes **Create Private Threads**, required by `/ticket`; without it the panel button fails with `Missing Permissions`.
 5. **Role hierarchy** — drag the CipherBot role above the roles it must assign (quarantine, verify). Discord refuses role changes above the bot's highest role.
+6. **Ticket staff visibility** — private threads are only visible to roles holding `Manage Threads` (or to members explicitly added). Grant `Manage Threads` to the staff role, otherwise staff cannot see tickets opened by other members. The `ticket_role` ping does not grant access.
 
 Commands are registered as **guild commands** on startup and on `guild_create`. There is a short propagation delay after the first registration; refresh the client if the list looks stale.
 
@@ -49,6 +50,8 @@ MONITORED_CATEGORIES=123456789012345678,234567890123456789
 ```
 
 Optional intel keys: `NVD_API_KEY`, `VT_API_KEY`, `IPINFO_TOKEN`. Without them, the corresponding lookups either degrade (NVD public rate limit) or explain that a key is required (VirusTotal).
+
+The polls, tags, tickets, `/start` and `/recon` features add **no environment variables**. `/recon`, `/intel dns` and `/tool` need no API key; they only need outbound HTTPS.
 
 Secret handling:
 
@@ -155,6 +158,8 @@ location / { return 404; }
 
 The bot itself needs **no inbound traffic** from Discord (gateway is outbound); the HTTP server exists only for probes.
 
+Outbound HTTPS (443) is required to `discord.com`/`gateway.discord.gg`, plus the optional intel and recon hosts: `services.nvd.nist.gov`, `www.virustotal.com`, `ipinfo.io`, `rdap.org`, `cloudflare-dns.com`, `crt.sh`, `internetdb.shodan.io`, `web.archive.org` and `urlscan.io`. `/recon` only queries those fixed passive APIs — it never sends traffic to the domain or IP being looked up, and IP targets must be globally routable.
+
 If you change `HEALTH_ADDR`, remember the Docker healthcheck still probes `127.0.0.1:8080`. Either keep the default port or override the healthcheck.
 
 ---
@@ -193,7 +198,7 @@ Alternative: `docker compose stop cipherbot`, copy `cipherbot.db` **and** the `-
 Test restores quarterly:
 
 1. Open the backup read-only: `sqlite3 backup.db 'PRAGMA integrity_check;'` — expect `ok`.
-2. Verify row counts for `guild_config`, `cases` and `ctf_challenges`.
+2. Verify row counts for `guild_config`, `cases`, `ctf_challenges`, `tags`, `polls` and `tickets`.
 3. During a maintenance window, start the bot with `DATABASE_PATH` pointing at the restored copy and the real token; confirm `/healthz` and `/stats`.
 
 A restore is only proven when the bot boots against the restored file.
@@ -218,7 +223,7 @@ curl -fsS http://127.0.0.1:8080/healthz
 docker compose logs --since 5m cipherbot | grep -Ei 'error|warn|connected'
 ```
 
-Schema migrations run at startup, gated by `PRAGMA user_version`, and are idempotent. They are forward-only: rolling back to an older binary after a migration may not work. Pin image tags (`ghcr.io/cleeryy/cipherbot:1.2.3`) instead of `latest` if you need controlled rollbacks, and keep the pre-upgrade backup until the new version has run for a day.
+Schema migrations run at startup, gated by `PRAGMA user_version`, and are idempotent. Schema **v2** adds `tags`, `polls`, `poll_votes` and `tickets`; the upgrade is automatic, no manual SQL is needed. They are forward-only: rolling back to an older binary after a migration may not work. Pin image tags (`ghcr.io/cleeryy/cipherbot:1.2.3`) instead of `latest` if you need controlled rollbacks, and keep the pre-upgrade backup until the new version has run for a day.
 
 ---
 
@@ -277,6 +282,7 @@ Useful series and suggested alerts:
 | `NVD_API_KEY` | `/intel cve`, `/intel cve-latest`, `/intel cve-search`, daily digest | Public access is heavily rate-limited (requests per rolling 30 s); a key raises it. |
 | `VT_API_KEY` | `/intel hash`, `/intel vt` | Free keys allow ~4 requests/minute and a low daily quota. Cached results help. |
 | `IPINFO_TOKEN` | `/intel ip` (enrichment) | Optional; RDAP still answers without it. |
+| none | `/recon`, `/intel dns`, `/tool` | Fixed public APIs only; no key, but outbound HTTPS required. |
 
 All external calls use fixed hosts and a 5-second timeout. A missing key never crashes a command; it produces an ephemeral explanation.
 
@@ -290,6 +296,8 @@ All external calls use fixed hosts and a 5-second timeout. A missing key never c
 - [ ] `/metrics` not reachable from the internet.
 - [ ] Data directory `0700`, backups encrypted at rest if they leave the host.
 - [ ] Bot role above quarantine/verify roles; no `Administrator` permission granted.
+- [ ] Staff role holds `Manage Threads` (otherwise private ticket threads are invisible), and `Create Private Threads` is in the invite integer.
+- [ ] Outbound HTTPS allowed to Discord and the passive recon/intel hosts; no inbound bot traffic.
 - [ ] `ENABLE_MEMBER_INTENT=true` only when the anti-raid gate is actually used.
 - [ ] Log level `info`; no tokens or flags in logs (the `Secret` type redacts them).
 - [ ] Restore drill completed against a backup.
@@ -303,9 +311,11 @@ All external calls use fixed hosts and a 5-second timeout. A missing key never c
 2. [ ] Bot invited with `bot` + `applications.commands` and the permission integer.
 3. [ ] `.env` filled; data directory owned by `10001`.
 4. [ ] `docker compose up -d`; logs show `Connected as` and command registration.
-5. [ ] `/help`, `/ping`, `/about` answer.
-6. [ ] `/config view` shows defaults; set modlog, verify role, CTF channel.
+5. [ ] `/help`, `/ping`, `/about`, `/start` answer.
+6. [ ] `/config view` shows defaults; set modlog, verify role, CTF channel, ticket role.
 7. [ ] `/mod verify-panel` posts a working button (role hierarchy checked).
-8. [ ] `/healthz` returns `ok`; `/metrics` scraped internally.
-9. [ ] Backup job scheduled and one restore verified.
-10. [ ] Alerting on `cipherbot_db_ok` and process restarts.
+8. [ ] `/ticket panel` posts a panel; opening a ticket creates a private thread staff can see (Manage Threads checked).
+9. [ ] `/recon subdomains domain:<your-domain>` returns data and `/tag add`/`/tag get` round-trips.
+10. [ ] `/healthz` returns `ok`; `/metrics` scraped internally.
+11. [ ] Backup job scheduled and one restore verified.
+12. [ ] Alerting on `cipherbot_db_ok` and process restarts.

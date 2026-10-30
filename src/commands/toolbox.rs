@@ -9,7 +9,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::bot::{BotResult, SharedState};
-use crate::util::{cvss, embeds, encodings, entropy, hash, hashid, opts, respond, text, time};
+use crate::util::{
+    cvss, embeds, encodings, entropy, hash, hashid, ipcalc, opts, respond, text, time, timestamp,
+};
 use anyhow::{Context as _, Result};
 use serenity::all::{
     Colour, CommandInteraction, CommandOptionType, Context, CreateCommand, CreateCommandOption,
@@ -74,6 +76,21 @@ pub fn commands() -> Vec<CreateCommand> {
                 "token",
                 "JWT to decode (ephemeral)",
                 2_000,
+            ))
+            .add_option(hash_like())
+            .add_option(single(
+                "ipcalc",
+                "Analyse an IPv4 or IPv6 CIDR block",
+                "cidr",
+                "CIDR block, e.g. 10.0.0.0/24 or 2001:db8::/32",
+                50,
+            ))
+            .add_option(single(
+                "timestamp",
+                "Convert a timestamp to UTC, unix time and RFC 3339",
+                "value",
+                "`now`, unix seconds, unix milliseconds or RFC 3339",
+                64,
             )),
     ]
 }
@@ -96,6 +113,27 @@ fn encode_like(name: &str, description: &str) -> CreateCommandOption {
                 .required(true)
                 .max_length(1_900),
         )
+}
+
+fn hash_like() -> CreateCommandOption {
+    CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "hash",
+        "Compute an MD5, SHA-1, SHA-256 or SHA-512 hex digest",
+    )
+    .add_sub_option(
+        CreateCommandOption::new(CommandOptionType::String, "algorithm", "Hash algorithm")
+            .required(true)
+            .add_string_choice("md5", "md5")
+            .add_string_choice("sha1", "sha1")
+            .add_string_choice("sha256", "sha256")
+            .add_string_choice("sha512", "sha512"),
+    )
+    .add_sub_option(
+        CreateCommandOption::new(CommandOptionType::String, "value", "Text to hash")
+            .required(true)
+            .max_length(4_000),
+    )
 }
 
 fn single(
@@ -126,6 +164,9 @@ pub async fn handle(state: &SharedState, ctx: &Context, cmd: &CommandInteraction
         "password" => password_cmd(state, ctx, cmd, options).await,
         "dork" => dork_cmd(ctx, cmd, options).await,
         "jwt" => jwt_cmd(ctx, cmd, options).await,
+        "hash" => hash_cmd(ctx, cmd, options).await,
+        "ipcalc" => ipcalc_cmd(ctx, cmd, options).await,
+        "timestamp" => timestamp_cmd(ctx, cmd, options).await,
         other => respond::error(ctx, cmd, format!("Unknown /tool subcommand `{other}`.")).await,
     }
 }
@@ -604,6 +645,105 @@ fn claims_lines(claims: &[(String, String)]) -> String {
     format!("**Claims**\n{lines}")
 }
 
+// -------------------------------------------------------------------- hash --
+
+async fn hash_cmd(
+    ctx: &Context,
+    cmd: &CommandInteraction,
+    options: &[serenity::all::CommandDataOption],
+) -> BotResult<()> {
+    let algorithm = opts::req_str(options, "algorithm")?;
+    let value = opts::req_str(options, "value")?;
+    let digest = match hash_value(algorithm, value) {
+        Ok(digest) => digest,
+        Err(error) => return respond::error(ctx, cmd, error.to_string()).await,
+    };
+
+    let label = algorithm.trim().to_ascii_uppercase();
+    let content = format!(
+        "**{label}** digest of {} byte(s)\n{}\n-# Lowercase hex.",
+        value.len(),
+        code_block(&digest)
+    );
+    respond::text(ctx, cmd, content, true).await
+}
+
+/// Lowercase hex digest. `algorithm` is case-insensitive so callers are not
+/// tied to the Discord choice casing.
+fn hash_value(algorithm: &str, value: &str) -> Result<String> {
+    use md5::Digest as _;
+
+    let digest = match algorithm.trim().to_ascii_lowercase().as_str() {
+        "md5" => hex::encode(md5::Md5::digest(value.as_bytes())),
+        "sha1" => hex::encode(sha1::Sha1::digest(value.as_bytes())),
+        "sha256" => hex::encode(sha2::Sha256::digest(value.as_bytes())),
+        "sha512" => hex::encode(sha2::Sha512::digest(value.as_bytes())),
+        other => {
+            anyhow::bail!("Unsupported hash algorithm `{other}` (md5, sha1, sha256, sha512).")
+        }
+    };
+    Ok(digest)
+}
+
+// ------------------------------------------------------------------ ipcalc --
+
+async fn ipcalc_cmd(
+    ctx: &Context,
+    cmd: &CommandInteraction,
+    options: &[serenity::all::CommandDataOption],
+) -> BotResult<()> {
+    let raw = opts::req_str(options, "cidr")?;
+    let report = match ipcalc::parse(raw) {
+        Ok(report) => report,
+        Err(error) => return respond::error(ctx, cmd, error.to_string()).await,
+    };
+
+    let mut notes = String::new();
+    if report.family == ipcalc::Family::V6 {
+        notes.push_str("\n-# IPv6 has no broadcast address; every address in the block is usable.");
+    }
+    if report.normalized {
+        notes.push_str("\n-# Host bits were cleared; the network address is shown.");
+    }
+
+    let content = format!(
+        "**{} — {}**\n{}{notes}\n-# Scope: {} · {}",
+        report.family.label(),
+        report.cidr(),
+        code_block(&report.lines()),
+        report.scope,
+        report.classification,
+    );
+    respond::text(ctx, cmd, content, true).await
+}
+
+// --------------------------------------------------------------- timestamp --
+
+async fn timestamp_cmd(
+    ctx: &Context,
+    cmd: &CommandInteraction,
+    options: &[serenity::all::CommandDataOption],
+) -> BotResult<()> {
+    let raw = opts::req_str(options, "value")?;
+    let stamp = match timestamp::parse(raw) {
+        Ok(stamp) => stamp,
+        Err(error) => return respond::error(ctx, cmd, error.to_string()).await,
+    };
+
+    let embed = embeds::footer(
+        CreateEmbed::new()
+            .title("Timestamp")
+            .description(format!("```\n{}\n```", stamp.utc()))
+            .colour(embeds::BLUE)
+            .field("Unix seconds", stamp.unix_seconds().to_string(), true)
+            .field("Unix milliseconds", stamp.unix_millis().to_string(), true)
+            .field("Weekday", stamp.weekday(), true)
+            .field("RFC 3339", stamp.rfc3339(), true)
+            .field("Parsed as", stamp.source, true),
+    );
+    respond::ephemeral(ctx, cmd, embed).await
+}
+
 // ---------------------------------------------------------------- rendering --
 
 /// Fenced code block, truncating the body to [`MAX_OUTPUT`] characters.
@@ -643,11 +783,21 @@ mod tests {
             .map(|option| option["name"].as_str().unwrap_or_default())
             .collect();
         for expected in [
-            "encode", "decode", "hashid", "entropy", "cvss", "password", "dork", "jwt",
+            "encode",
+            "decode",
+            "hashid",
+            "entropy",
+            "cvss",
+            "password",
+            "dork",
+            "jwt",
+            "hash",
+            "ipcalc",
+            "timestamp",
         ] {
             assert!(names.contains(&expected), "missing /tool {expected}");
         }
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 11);
 
         for option in options {
             let description = option["description"].as_str().unwrap_or_default();
@@ -691,6 +841,51 @@ mod tests {
         assert!(!block[3..block.len() - 3].contains("```"));
 
         assert!(code_block("").contains("(empty)"));
+    }
+
+    #[test]
+    fn hash_value_matches_known_vectors() {
+        assert_eq!(
+            hash_value("md5", "abc").expect("md5"),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+        assert_eq!(
+            hash_value("sha1", "abc").expect("sha1"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            hash_value("sha256", "abc").expect("sha256"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hash_value("sha512", "abc").expect("sha512"),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+        assert_eq!(
+            hash_value("MD5", "").expect("empty input"),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+        assert!(hash_value("crc32", "abc").is_err());
+    }
+
+    #[test]
+    fn hash_subcommand_lists_four_algorithms() {
+        let commands = commands();
+        let value = serde_json::to_value(&commands[0]).expect("serialize");
+        let hash = value["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .find(|option| option["name"] == "hash")
+            .expect("hash");
+        let algorithm = hash["options"]
+            .as_array()
+            .expect("hash options")
+            .iter()
+            .find(|option| option["name"] == "algorithm")
+            .expect("algorithm");
+        assert_eq!(algorithm["choices"].as_array().map(Vec::len), Some(4));
     }
 
     #[test]

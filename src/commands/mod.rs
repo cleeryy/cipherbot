@@ -11,6 +11,11 @@ pub mod intel;
 pub mod learning;
 pub mod links;
 pub mod moderation;
+pub mod poll;
+pub mod recon;
+pub mod start;
+pub mod tag;
+pub mod ticket;
 pub mod toolbox;
 
 use serenity::all::{
@@ -32,10 +37,21 @@ const HELP_TABLE: &[(&str, &str)] = &[
     ("links", "Browse the community link archive"),
     ("mod", "Moderation: warn, timeout, kick, ban, purge, cases"),
     ("ping", "Check that the bot is alive"),
+    ("poll", "Create button-based polls with live results"),
     ("profile", "Show a member profile"),
+    (
+        "recon",
+        "Passive recon: subdomains, InternetDB, Wayback, urlscan",
+    ),
     ("report", "Report a member or message to the staff"),
+    (
+        "start",
+        "Interactive guide: explore every feature with buttons",
+    ),
     ("stats", "Bot statistics"),
     ("suggest", "Submit a server suggestion"),
+    ("tag", "Reusable snippets and FAQ tags"),
+    ("ticket", "Private support tickets and staff queue"),
     ("tool", "Encoding, hashing, CVSS and tradecraft tools"),
 ];
 
@@ -53,6 +69,11 @@ pub fn all_commands() -> Vec<CreateCommand> {
     commands.extend(learning::commands());
     commands.extend(community::commands());
     commands.extend(links::commands());
+    commands.extend(start::commands());
+    commands.extend(poll::commands());
+    commands.extend(recon::commands());
+    commands.extend(tag::commands());
+    commands.extend(ticket::commands());
     commands.extend(core_commands());
     commands
 }
@@ -90,6 +111,11 @@ pub async fn dispatch(
         "tool" => toolbox::handle(state, ctx, cmd).await,
         "learn" => learning::handle(state, ctx, cmd).await,
         "links" => links::handle(state, ctx, cmd).await,
+        "start" => start::handle(state, ctx, cmd).await,
+        "poll" => poll::handle(state, ctx, cmd).await,
+        "recon" => recon::handle(state, ctx, cmd).await,
+        "tag" => tag::handle(state, ctx, cmd).await,
+        "ticket" => ticket::handle(state, ctx, cmd).await,
         "profile" | "leaderboard" | "report" | "suggest" | "config" => {
             community::handle(state, ctx, cmd).await
         }

@@ -1,4 +1,4 @@
-# CipherBot v1.0 — Design Notes
+# CipherBot — Design Notes (v1 + v2)
 
 > Historical design notes from the v1.0 build, kept for contributors who want the
 > rationale behind the module boundaries, database schema and safety rules. The
@@ -9,16 +9,17 @@
 ## 0. Product
 
 CipherBot is the operating system of a cybersecurity Discord community. One Rust
-binary, one SQLite file, no external services required. Optional API keys unlock
-more intel. It must feel like a finished product: consistent embeds, ephemeral
+binary, one SQLite file, no external database or queue. Optional API keys unlock
+more intel; passive recon and DNS use fixed public APIs. It must feel like a finished product: consistent embeds, ephemeral
 errors, clear permissions, audit trail, docs, tests, CI, Docker healthcheck.
 
 Pillars: **curation** (links), **protection** (automod / anti-raid / cases),
-**competition** (CTF), **intel** (CVE / ATT&CK / RDAP), **tradecraft** (toolbox),
+**competition** (CTF), **intel** (CVE / ATT&CK / RDAP / DNS), **tradecraft** (toolbox),
 **learning** (quiz / glossary / roadmaps), **community** (profiles / leaderboards /
-reports / suggestions), **operations** (health / metrics / graceful shutdown).
+reports / suggestions), **support** (tickets / tags / polls), **recon** (passive
+OSINT), **operations** (health / metrics / graceful shutdown).
 
-Non-goals for v1: music, tickets, economy, i18n, dashboard, sharding.
+Non-goals for v1: music, economy, i18n, dashboard, sharding.
 
 ## 1. Ground rules
 
@@ -48,14 +49,16 @@ src/bot.rs               AppState, SharedState, Services
 src/handler.rs           EventHandler: routing only
 src/commands/mod.rs      registry + dispatch + help data
 src/commands/{moderation,ctf,intel,toolbox,learning,community,links}.rs
+src/commands/{start,poll,tag,ticket,recon}.rs
 src/components/mod.rs    component router (buttons/selects)
 src/db/mod.rs            Database, connection, migrations
 src/db/{cases,ctf,users,links,intel,guild,community,evidence}.rs   impl blocks
+src/db/{poll,tag,ticket}.rs                                        impl blocks
 src/security/{automod,raid,flagwatch,phishing}.rs
-src/services/{nvd,rdap,ipinfo,vt,scheduler}.rs
+src/services/{nvd,rdap,ipinfo,vt,dns,recon,scheduler}.rs
 src/ops/{health,metrics}.rs
 src/util/{respond,embeds,opts,time,text,hash,permissions}
-                     + {encodings,hashid,entropy,cvss}.rs
+                     + {encodings,hashid,entropy,cvss,ipcalc,timestamp}.rs
 src/content/*.rs         static data (DONE)
 ```
 
@@ -98,7 +101,8 @@ Components (`src/components/mod.rs`):
 ```rust
 pub async fn dispatch(state: &SharedState, ctx: &Context, ci: &ComponentInteraction) -> BotResult<()>;
 // custom_id format: "module:action[:args...]", <=100 chars, stateless.
-// routes by prefix: "verify:" -> moderation, "quiz:" -> learning, "vote:" -> community, "ctf:" -> ctf.
+// routes by prefix: "verify:" -> moderation, "quiz:" -> learning, "vote:" -> community, "ctf:" -> ctf,
+//                   "start:" -> start, "poll:" -> poll, "ticket:" -> ticket.
 ```
 
 Modals: not used in v1; log and politely reject.
@@ -165,11 +169,30 @@ evidence(id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, channe
 -- legacy, keep: tracked_messages, channel_threads
 ```
 
+Schema v2 (added on top of v1; `PRAGMA user_version = 2`):
+
+```sql
+tags(guild_id INTEGER NOT NULL, name TEXT NOT NULL, content TEXT NOT NULL,
+      created_by INTEGER NOT NULL, uses INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL, PRIMARY KEY(guild_id, name))
+polls(id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
+      channel_id INTEGER NOT NULL, message_id INTEGER, author_id INTEGER NOT NULL,
+      question TEXT NOT NULL, options_json TEXT NOT NULL, created_at INTEGER NOT NULL,
+      closed_at INTEGER)
+poll_votes(poll_id INTEGER NOT NULL, user_id INTEGER NOT NULL, choice INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, PRIMARY KEY(poll_id, user_id))
+tickets(thread_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'open', created_at INTEGER NOT NULL,
+      closed_by INTEGER, closed_at INTEGER)
+CREATE INDEX idx_polls_guild   ON polls(guild_id, id DESC);
+CREATE INDEX idx_tickets_guild ON tickets(guild_id, user_id);
+```
+
 `GuildSettings` (serde, in `src/db/guild.rs`, defaults for everything):
-`modlog_channel`, `quarantine_role`, `verify_role`, `ctf_channel`, `digest_channel`,
-`locale` ("en"), `automod: { invites, phishing, mass_mentions, duplicate_spam,
-caps, token_leaks }` all bool, `raid: { enabled, min_account_age_hours, require_avatar }`,
-`links: { auto_thread, ttl_hours }`.
+`modlog_channel`, `quarantine_role`, `verify_role`, `ticket_role`, `ctf_channel`,
+`digest_channel`, `locale` ("en"), `automod: { invites, phishing, mass_mentions,
+duplicate_spam, caps, token_leaks }` all bool, `raid: { enabled,
+min_account_age_hours, require_avatar }`, `links: { auto_thread, ttl_hours }`.
 
 ### Config (frozen — `src/config.rs`)
 
@@ -212,22 +235,52 @@ pub fn duration(opts, name) -> BotResult<i64>; // seconds, "10m"/"2h"/"7d"
 The authoritative list of commands, options and permissions is [`USAGE.md`](USAGE.md).
 Descriptions are ≤100 chars, names are lowercase, options are snake_case, and
 permissions are re-checked in code (`default_member_permissions` is cosmetic).
+`HELP_TABLE` in `src/commands/mod.rs` lists all **20** top-level commands; the
+`/start` Help panel reuses it and falls back to a local entry if the registry lags.
 
+- `/start` — ephemeral button hub, 14 panels besides Home (`start:<slug>`, stateless).
 - `/mod` — `warn`, `warnings`, `timeout`, `untimeout`, `kick`, `ban`, `unban`,
   `purge`, `slowmode`, `lock`, `unlock`, `case view|list|close`, `raidmode`,
   `quarantine`, `unquarantine`, `verify-panel`, `reports`, `report-close`,
   `evidence`. Punitive actions record a case and post a modlog embed.
 - `/ctf` — `create`, `list`, `info`, `solve`, `scoreboard`, `delete`.
-- `/intel` — `cve`, `cve-latest`, `cve-search`, `mitre`, `ip`, `domain`, `hash`, `vt`.
-- `/tool` — `encode`, `decode`, `hashid`, `entropy`, `cvss`, `password`, `dork`, `jwt`.
-- `/learn` — `quiz`, `glossary`, `roadmap`, `resources`, `tip`.
+- `/intel` — `cve`, `cve-latest`, `cve-search`, `mitre`, `ip`, `dns`, `domain`, `hash`, `vt`.
+- `/tool` — `encode`, `decode`, `hashid`, `entropy`, `cvss`, `password`, `dork`,
+  `jwt`, `hash`, `ipcalc`, `timestamp`.
+- `/learn` — `quiz`, `glossary`, `roadmap`, `resources`, `tip`; every reply ephemeral.
+- `/poll` — `create`, `close`, `results`; one public message, votes edit it in place.
+- `/tag` — `get`, `list` (public), `add`, `remove` (`Manage Messages`).
+- `/ticket` — `panel` (`Manage Guild`), `close`, `list`; private threads + DB row.
+- `/recon` — `subdomains`, `ip`, `wayback`, `urlscan`; fixed passive APIs only,
+  public IPs only, 5-second cooldown.
 - `/links` — `search`, `recent`, `stats`.
 - `/profile [user]`, `/leaderboard [metric]`, `/report`, `/suggest`.
-- `/config` — `view`, `set`, `automod`, `modlog`, `ctf-channel`, `verify`, `links`.
+- `/config` — `view`, `set` (includes `ticket_role`), `automod`, `modlog`,
+  `ctf-channel`, `verify`, `links`.
 - `/help [command]`, `/stats`, `/ping`, `/about`.
 
 Component IDs: `verify:grant`, `quiz:<question_id>:<choice_index>`,
-`vote:<up|down>:<suggestion_id>`, `ctf:hint:<challenge_id>` (reserved).
+`vote:<up|down>:<suggestion_id>`, `ctf:hint:<challenge_id>` (reserved),
+`start:<slug>`, `poll:vote:<poll_id>:<index>`, `poll:close:<poll_id>`,
+`ticket:open`, `ticket:close`.
+
+### v2 surface notes
+
+- **`/start`** is documentation, not power: it only reads the registry and the
+  clicker's permissions. Panels are edited in place; a staff panel is re-checked
+  on each click so a cached button cannot escalate.
+- **`/poll`** keeps one public message per poll and edits it on every vote, which
+  avoids per-vote channel spam and needs no in-memory session state.
+- **`/tag`** stores raw content and escapes markdown at render time, so editing a
+  tag never stacks backslashes; `get` bumps `uses` in the same locked read.
+- **`/ticket`** uses private threads, not channel clones. Discord grants staff
+  access through `Manage Threads`, not through a role overwrite; the design
+  documents that limitation instead of adding every staff member to every thread.
+- **`/recon`** is passive by construction: fixed API hosts, validated bare
+  hostnames, public-IP-only targets and no generic URL fetcher.
+- **`/learn`** replies are ephemeral across the board (quiz, glossary, roadmap,
+  resources, tip) — anti-spam and answer confidentiality; buttons still update
+  stats.
 
 ## 4. Quality gates
 
