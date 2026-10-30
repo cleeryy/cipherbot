@@ -5,7 +5,8 @@
 //! while `cleanup_loop` and `scheduler::run` are spawned from `ready` because
 //! they need a `Context`.
 
-use std::sync::OnceLock;
+use std::collections::HashSet;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 use serenity::all::{
@@ -13,6 +14,7 @@ use serenity::all::{
     OnlineStatus, Ready, User,
 };
 use serenity::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::bot::SharedState;
 use crate::commands;
@@ -35,6 +37,36 @@ pub struct Handler {
 impl Handler {
     pub fn new(state: SharedState) -> Self {
         Self { state }
+    }
+
+    /// Register guild commands exactly once per process. `ready` and
+    /// `guild_create` fire concurrently on startup; without this guard both
+    /// bulk-overwrites race and Discord can keep duplicate command sets.
+    async fn register_guild_commands(&self, ctx: &Context, guild_id: GuildId, guild_name: &str) {
+        static REGISTERED: LazyLock<AsyncMutex<HashSet<u64>>> =
+            LazyLock::new(|| AsyncMutex::new(HashSet::new()));
+
+        let mut registered = REGISTERED.lock().await;
+        if registered.contains(&guild_id.get()) {
+            return;
+        }
+
+        match GuildId::set_commands(guild_id, &ctx.http, commands::all_commands()).await {
+            Ok(commands) => {
+                registered.insert(guild_id.get());
+                tracing::info!(
+                    "Registered {} command(s) in '{}' ({})",
+                    commands.len(),
+                    guild_name,
+                    guild_id
+                );
+            }
+            Err(error) => tracing::warn!(
+                "Command registration failed for '{}' ({}): {error}",
+                guild_name,
+                guild_id
+            ),
+        }
     }
 }
 
@@ -82,20 +114,8 @@ impl EventHandler for Handler {
             Ok(guilds) => {
                 self.state.metrics.set_guilds(guilds.len() as u64);
                 for guild in &guilds {
-                    match GuildId::set_commands(guild.id, &ctx.http, commands::all_commands()).await
-                    {
-                        Ok(registered) => tracing::info!(
-                            "Registered {} command(s) in '{}' ({})",
-                            registered.len(),
-                            guild.name,
-                            guild.id
-                        ),
-                        Err(error) => tracing::warn!(
-                            "Failed to register commands in '{}' ({}): {error}",
-                            guild.name,
-                            guild.id
-                        ),
-                    }
+                    self.register_guild_commands(&ctx, guild.id, &guild.name)
+                        .await;
                 }
             }
             Err(error) => tracing::warn!("Failed to fetch guild list: {error}"),
@@ -110,15 +130,8 @@ impl EventHandler for Handler {
             is_new
         );
 
-        match GuildId::set_commands(guild.id, &ctx.http, commands::all_commands()).await {
-            Ok(registered) => tracing::info!(
-                "Registered {} command(s) in '{}' ({})",
-                registered.len(),
-                guild.name,
-                guild.id
-            ),
-            Err(error) => tracing::warn!("Command registration failed for {}: {error}", guild.id),
-        }
+        self.register_guild_commands(&ctx, guild.id, &guild.name)
+            .await;
 
         self.state
             .metrics
