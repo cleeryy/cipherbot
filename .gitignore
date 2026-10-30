@@ -1,4 +1,20 @@
+# Rust build output
 /target
+
+# Secrets and local configuration
 .env
-*.db
+.env.*
+!.env.example
 config.yaml
+
+# SQLite data (WAL mode creates the -wal/-shm companions)
+*.db
+*.db-wal
+*.db-shm
+/data
+
+# Logs and editor noise
+*.log
+.DS_Store
+.idea/
+.vscode/

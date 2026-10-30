@@ -1,259 +1,255 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
+//! Serenity event router. Logic lives in `commands`, `components`, `security`,
+//! `services` and `commands::links`; this file only wires events to them.
+//!
+//! The health server is spawned from `main` (single owner, easier shutdown),
+//! while `cleanup_loop` and `scheduler::run` are spawned from `ready` because
+//! they need a `Context`.
 
-use linkify::{LinkFinder, LinkKind};
-use serenity::all::{ActivityData, ActivityType, ChannelType};
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use serenity::all::{
+    ActivityData, Context, EventHandler, Guild, GuildId, Interaction, Member, Message,
+    OnlineStatus, Ready, User,
+};
 use serenity::async_trait;
-use serenity::builder::CreateThread;
-use serenity::model::channel::Channel;
-use serenity::model::prelude::*;
-use serenity::prelude::*;
 
-use crate::config::Config;
-use crate::db::Database;
+use crate::bot::SharedState;
+use crate::commands;
+use crate::components;
+use crate::security;
+use crate::services;
+use crate::util::respond;
+
+/// Result of one message hook. Any `Stop` ends the pipeline for that message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookResult {
+    Continue,
+    Stop,
+}
 
 pub struct Handler {
-    pub config: Config,
-    /// Persisted last thread per channel, loaded from DB on start
-    /// and updated whenever a thread is created.
-    pub last_threads: Mutex<HashMap<ChannelId, ChannelId>>,
-    pub database: Arc<Database>,
+    pub state: SharedState,
 }
 
 impl Handler {
-    pub fn new(config: Config, database: Arc<Database>) -> Self {
-        tracing::debug!("Handler created with {} monitored category(ies)", config.categories.len());
-        Handler {
-            config,
-            last_threads: Mutex::new(HashMap::new()),
-            database,
-        }
+    pub fn new(state: SharedState) -> Self {
+        Self { state }
     }
-
-    fn is_monitored(&self, channel: &GuildChannel) -> bool {
-        let Some(parent_id) = channel.parent_id else {
-            return false;
-        };
-        self.config
-            .categories
-            .iter()
-            .any(|cat| cat.id == parent_id.get())
-    }
-
-    fn category_config(&self, channel: &GuildChannel) -> Option<crate::config::CategoryConfig> {
-        let parent_id = channel.parent_id?;
-        self.config
-            .categories
-            .iter()
-            .find(|cat| cat.id == parent_id.get())
-            .cloned()
-    }
-
 }
+
+const STATUSES: &[&str] = &[
+    "🔍 scanning ports",
+    "🛡️ bypassing firewall",
+    "💀 escalating privileges",
+    "📡 sniffing packets",
+    "🔓 cracking hashes",
+    "🌐 tracing routes",
+    "🎯 exploiting vectors",
+];
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot {
-            return;
-        }
-
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        let _ = self.state.bot_user_id.set(ready.user.id);
         tracing::info!(
-            "[MESSAGE] author={} channel={} guild={:?} content(len={})={:?}",
-            msg.author.name,
-            msg.channel_id,
-            msg.guild_id,
-            msg.content.len(),
-            msg.content.chars().take(150).collect::<String>(),
+            "Connected as {} ({}) — {} guild(s)",
+            ready.user.name,
+            ready.user.id,
+            ready.guilds.len()
         );
 
-        let channel = match msg.channel_id.to_channel(&ctx.http).await {
-            Ok(Channel::Guild(ch)) => ch,
-            Ok(_) => {
-                tracing::debug!("Non-guild channel, skipping");
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to resolve channel {}: {}", msg.channel_id, e);
-                return;
-            }
-        };
+        static BACKGROUND_STARTED: OnceLock<()> = OnceLock::new();
+        if BACKGROUND_STARTED.set(()).is_ok() {
+            spawn_presence_rotation(&ctx);
+            tokio::spawn(commands::links::cleanup_loop(self.state.clone()));
+            tokio::spawn(services::scheduler::run(self.state.clone(), ctx.clone()));
 
-        if matches!(
-            channel.kind,
-            ChannelType::PublicThread | ChannelType::PrivateThread
-        ) {
-            tracing::debug!("Message in thread, skipping");
-            return;
-        }
-
-        let parent_id = channel.parent_id.map(|id| id.get());
-        let monitored_ids: Vec<u64> = self.config.categories.iter().map(|c| c.id).collect();
-
-        tracing::info!(
-            "[CHECK] channel='{}' ({}) parent={:?} monitored={:?}",
-            channel.name,
-            channel.id,
-            parent_id,
-            monitored_ids,
-        );
-
-        if !self.is_monitored(&channel) {
-            tracing::info!("[SKIP] '{}' not in monitored categories", channel.name);
-            return;
-        }
-
-        tracing::info!("[IN] '{}' — processing message", channel.name);
-
-        let cat_config = match self.category_config(&channel) {
-            Some(c) => c,
-            None => return,
-        };
-
-        let finder = LinkFinder::new();
-        let links: Vec<String> = finder
-            .links(&msg.content)
-            .filter(|l| matches!(l.kind(), LinkKind::Url))
-            .map(|l| l.as_str().to_string())
-            .collect();
-
-        let has_link = !links.is_empty();
-        tracing::info!("[LINKS] has_link={} urls={:?}", has_link, links);
-
-        if has_link && cat_config.auto_thread_links {
-            let thread_name = msg
-                .content
-                .chars()
-                .take(80)
-                .collect::<String>()
-                .replace('\n', " ")
-                .trim()
-                .to_string();
-            let thread_name = if thread_name.is_empty() {
-                "Lien".to_string()
-            } else {
-                thread_name
-            };
-
-            tracing::info!(
-                "[THREAD] Creating '{}' from msg {} in '{}'",
-                thread_name,
-                msg.id,
-                channel.name,
-            );
-
-            match msg
-                .channel_id
-                .create_thread_from_message(&ctx.http, msg.id, CreateThread::new(thread_name.clone()))
-                .await
-            {
-                Ok(thread) => {
-                    tracing::info!("[THREAD] ✅ Created '{}' (id={})", thread_name, thread.id);
-                    self.last_threads.lock().unwrap().insert(channel.id, thread.id);
-                    if let Err(e) = self.database.set_last_thread(channel.id.get(), thread.id.get()) {
-                        tracing::warn!("Failed to persist last_thread: {}", e);
-                    }
+            // Warm the phishing blocklist immediately instead of waiting for the
+            // first 15-minute scheduler tick.
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                match security::phishing::refresh(&state).await {
+                    Ok(count) => tracing::info!("Phishing feed warmed: {count} domain(s)"),
+                    Err(error) => tracing::warn!("Initial phishing feed refresh failed: {error}"),
                 }
-                Err(e) => {
-                    tracing::error!("[THREAD] ❌ Failed: {}", e);
-                }
-            }
-        } else if !has_link {
-            // Forward to the last thread created in this channel, if any
-            let thread_id = self.last_threads.lock().unwrap().get(&channel.id).copied();
-            if let Some(thread_id) = thread_id {
-                tracing::info!("[FORWARD] Forwarding msg {} to thread {} in '{}'", msg.id, thread_id, channel.name);
-                let forwarded = format!("{}\n> {}", msg.author.mention(), msg.content);
-                if let Err(e) = thread_id.say(&ctx.http, &forwarded).await {
-                    tracing::warn!("[FORWARD] Failed to send to thread {}: {}", thread_id, e);
-                }
-            } else {
-                tracing::debug!("[FORWARD] No last thread for channel '{}', skipping forward", channel.name);
-            }
+            });
 
-            tracing::info!("[DELETE] Deleting non-link message {} from '{}'", msg.id, channel.name);
-            if let Err(e) = msg.delete(&ctx.http).await {
-                tracing::warn!("[DELETE] Failed to delete message {}: {}", msg.id, e);
-            } else {
-                tracing::debug!("[DELETE] Deleted non-link message {}", msg.id);
-            }
+            tracing::info!("Background loops spawned (presence, cleanup, scheduler)");
         }
-    }
-
-    async fn ready(&self, ctx: Context, _data_about_bot: Ready) {
-        tracing::info!("cipherbot is connected!");
 
         match ctx.http.get_guilds(None, None).await {
             Ok(guilds) => {
-                tracing::info!("Connected to {} guild(s):", guilds.len());
+                self.state.metrics.set_guilds(guilds.len() as u64);
                 for guild in &guilds {
-                    tracing::info!("  - {} (id={})", guild.name, guild.id);
+                    match GuildId::set_commands(guild.id, &ctx.http, commands::all_commands()).await
+                    {
+                        Ok(registered) => tracing::info!(
+                            "Registered {} command(s) in '{}' ({})",
+                            registered.len(),
+                            guild.name,
+                            guild.id
+                        ),
+                        Err(error) => tracing::warn!(
+                            "Failed to register commands in '{}' ({}): {error}",
+                            guild.name,
+                            guild.id
+                        ),
+                    }
                 }
             }
-            Err(e) => {
-                tracing::warn!("Failed to fetch guild list: {}", e);
-            }
-        }
-
-        const STATUSES: &[&str] = &[
-            "🔍 scanning ports",
-            "🛡️ bypassing firewall",
-            "💀 escalating privileges",
-            "📡 sniffing packets",
-            "🔓 cracking hashes",
-            "🌐 tracing routes",
-            "🎯 exploiting vectors",
-        ];
-
-        let status = STATUSES[0];
-        ctx.set_presence(
-            Some(ActivityData {
-                name: String::new(),
-                kind: ActivityType::Custom,
-                state: Some(status.to_string()),
-                url: None,
-            }),
-            OnlineStatus::Online,
-        );
-        tracing::info!("[PRESENCE] Status set to \"{}\"", status);
-
-        // Rotate through statuses every hour
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            interval.tick().await; // skip first immediate tick
-            let mut i = 1usize;
-            loop {
-                interval.tick().await;
-                let status = STATUSES[i % STATUSES.len()];
-                ctx.set_presence(
-                    Some(ActivityData {
-                        name: String::new(),
-                        kind: ActivityType::Custom,
-                        state: Some(status.to_string()),
-                        url: None,
-                    }),
-                    OnlineStatus::Online,
-                );
-                tracing::debug!("[PRESENCE] Status rotated to \"{}\"", status);
-                i += 1;
-            }
-        });
-
-        // Load persisted last_thread entries into memory so forwarding
-        // works immediately after a restart.
-        match self.database.load_all_last_threads() {
-            Ok(entries) => {
-                let mut map = self.last_threads.lock().unwrap();
-                for (channel_id, thread_id) in entries {
-                    map.insert(ChannelId::new(channel_id), ChannelId::new(thread_id));
-                }
-                tracing::info!("Loaded {} last-thread mapping(s) from DB", map.len());
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load last_threads from DB: {}", e);
-            }
+            Err(error) => tracing::warn!("Failed to fetch guild list: {error}"),
         }
     }
+
+    async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
+        tracing::info!(
+            "Guild available: '{}' ({}), new={:?}",
+            guild.name,
+            guild.id,
+            is_new
+        );
+
+        match GuildId::set_commands(guild.id, &ctx.http, commands::all_commands()).await {
+            Ok(registered) => tracing::info!(
+                "Registered {} command(s) in '{}' ({})",
+                registered.len(),
+                guild.name,
+                guild.id
+            ),
+            Err(error) => tracing::warn!("Command registration failed for {}: {error}", guild.id),
+        }
+
+        self.state
+            .metrics
+            .set_guilds(ctx.cache.guilds().len() as u64);
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        match interaction {
+            Interaction::Command(cmd) => {
+                if let Err(error) = commands::dispatch(&self.state, &ctx, &cmd).await {
+                    self.state.metrics.inc_errors();
+                    tracing::error!("Command /{} failed: {error:#}", cmd.data.name);
+                    if let Err(reply_error) = respond::error(&ctx, &cmd, format!("{error:#}")).await
+                    {
+                        tracing::warn!("Could not report command error: {reply_error}");
+                    }
+                }
+            }
+            Interaction::Component(ci) => {
+                if let Err(error) = components::dispatch(&self.state, &ctx, &ci).await {
+                    self.state.metrics.inc_errors();
+                    tracing::error!("Component '{}' failed: {error:#}", ci.data.custom_id);
+                    let _ = ci
+                        .create_response(
+                            &ctx.http,
+                            serenity::all::CreateInteractionResponse::Message(
+                                serenity::all::CreateInteractionResponseMessage::new()
+                                    .content("Something went wrong. Please try again.")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                }
+            }
+            Interaction::Autocomplete(cmd) => {
+                // No option uses autocomplete today; answer with an empty list so
+                // Discord never shows "loading failed" if one is added later.
+                let _ = cmd
+                    .create_response(
+                        &ctx.http,
+                        serenity::all::CreateInteractionResponse::Autocomplete(
+                            serenity::all::CreateAutocompleteResponse::new(),
+                        ),
+                    )
+                    .await;
+            }
+            Interaction::Modal(mi) => {
+                let _ = mi
+                    .create_response(
+                        &ctx.http,
+                        serenity::all::CreateInteractionResponse::Message(
+                            serenity::all::CreateInteractionResponseMessage::new()
+                                .content("Modal submissions are not supported.")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn message(&self, ctx: Context, msg: Message) {
+        if msg.author.bot || msg.webhook_id.is_some() {
+            return;
+        }
+
+        self.state.metrics.inc_messages();
+
+        if security::automod::on_message(&self.state, &ctx, &msg).await == HookResult::Stop {
+            return;
+        }
+        if security::flagwatch::on_message(&self.state, &ctx, &msg).await == HookResult::Stop {
+            return;
+        }
+        // Community XP is awarded for every message that survives moderation;
+        // curation runs afterwards and may forward or remove the message.
+        let _ = crate::db::users::on_message(&self.state, &ctx, &msg).await;
+        if commands::links::on_message(&self.state, &ctx, &msg).await == HookResult::Stop {
+            return;
+        }
+    }
+
+    async fn guild_member_addition(&self, ctx: Context, member: Member) {
+        if !self.state.config.features.member_intent {
+            return;
+        }
+        if let Err(error) = security::raid::on_member_join(&self.state, &ctx, &member).await {
+            self.state.metrics.inc_errors();
+            tracing::warn!("Anti-raid join hook failed for {}: {error}", member.user.id);
+        }
+    }
+
+    async fn guild_member_removal(
+        &self,
+        ctx: Context,
+        guild_id: serenity::all::GuildId,
+        user: User,
+        _member_data: Option<Member>,
+    ) {
+        if !self.state.config.features.member_intent {
+            return;
+        }
+        if let Err(error) = security::raid::on_member_remove(&self.state, &ctx, &user).await {
+            self.state.metrics.inc_errors();
+            tracing::warn!(
+                "Anti-raid leave hook failed for {} in {guild_id}: {error}",
+                user.id
+            );
+        }
+    }
+}
+
+fn spawn_presence_rotation(ctx: &Context) {
+    ctx.set_presence(
+        Some(ActivityData::custom(STATUSES[0])),
+        OnlineStatus::Online,
+    );
+
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3_600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await; // skip the immediate tick
+        let mut index = 1usize;
+        loop {
+            interval.tick().await;
+            let status = STATUSES[index % STATUSES.len()];
+            ctx.set_presence(Some(ActivityData::custom(status)), OnlineStatus::Online);
+            tracing::debug!("Presence rotated to \"{status}\"");
+            index += 1;
+        }
+    });
 }

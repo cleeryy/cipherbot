@@ -1,4 +1,18 @@
-/target
+# Build context is only Cargo.toml, Cargo.lock and src/.
+target
 .git
+.gitignore
+.github
 .env
+.env.*
 *.db
+*.db-wal
+*.db-shm
+data
+config.yaml
+docs
+scripts
+*.md
+LICENSE
+Dockerfile
+docker-compose.yml

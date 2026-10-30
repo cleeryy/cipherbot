@@ -1,17 +1,50 @@
 [package]
 name = "cipherbot"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "Cybersecurity community Discord bot: moderation, CTF, threat intel, toolbox, learning and link curation."
+license = "MIT"
+repository = "https://github.com/cleeryy/cipherbot"
+readme = "README.md"
+keywords = ["discord", "security", "ctf", "moderation", "bot"]
+categories = ["command-line-utilities"]
 
 [dependencies]
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "cache", "rustls_backend"] }
+serenity = { version = "0.12", default-features = false, features = [
+    "client",
+    "gateway",
+    "model",
+    "cache",
+    "rustls_backend",
+] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_yaml = "0.9"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "gzip",
+] }
 linkify = "0.10"
+regex = "1"
+url = "2"
+sha2 = "0.10"
+sha1 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+parking_lot = "0.12"
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

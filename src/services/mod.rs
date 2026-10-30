@@ -1,0 +1,10 @@
+//! Outbound integrations and periodic jobs.
+//!
+//! `nvd`, `rdap`, `ipinfo` and `vt` are owned by the intel lane and are empty
+//! for now; the scheduler only touches core functionality.
+
+pub mod ipinfo;
+pub mod nvd;
+pub mod rdap;
+pub mod scheduler;
+pub mod vt;

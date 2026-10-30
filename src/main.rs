@@ -1,15 +1,29 @@
+//! CipherBot bootstrap: config, database, shared state, gateway client and
+//! graceful shutdown. The health server is also spawned here.
+
 use std::sync::Arc;
 
-use serenity::all::ChannelId;
-use serenity::prelude::*;
+use serenity::all::{Client, GatewayIntents};
 use tracing_subscriber::EnvFilter;
 
+mod bot;
+mod commands;
+mod components;
 mod config;
 mod db;
 mod handler;
+mod ops;
+mod security;
+mod services;
+mod util;
+
+#[allow(dead_code)]
+pub mod content;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::builder()
@@ -18,93 +32,63 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    dotenvy::dotenv().ok();
-
     let config = match config::Config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[FATAL] Configuration error: {e}");
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("[FATAL] Configuration error: {error}");
             std::process::exit(1);
         }
     };
-    tracing::info!(
-        "Configuration loaded — monitoring {} categorie(s): {:?}",
-        config.categories.len(),
-        config.categories.iter().map(|c| c.id).collect::<Vec<_>>()
-    );
 
     let database = Arc::new(db::Database::open(&config.database.path)?);
     database.initialize()?;
-    tracing::info!("Database initialized at {}", config.database.path);
+    tracing::info!("Database ready at '{}'", config.database.path);
 
-    let intents = GatewayIntents::GUILD_MESSAGES
+    let state = bot::build_state(config, database)?;
+
+    let mut intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILDS;
+        | GatewayIntents::GUILD_MODERATION;
+    if state.config.features.member_intent {
+        intents |= GatewayIntents::GUILD_MEMBERS;
+    }
 
-    let handler = handler::Handler::new(config.clone(), database.clone());
-    let mut client = Client::builder(&config.discord_token, intents)
-        .event_handler(handler)
+    tracing::info!(
+        "Starting CipherBot v{} — categories={:?}, health='{}' (enabled={}), member_intent={}",
+        env!("CARGO_PKG_VERSION"),
+        state
+            .config
+            .categories
+            .iter()
+            .map(|category| category.id)
+            .collect::<Vec<_>>(),
+        state.config.health.addr,
+        state.config.health.enabled,
+        state.config.features.member_intent,
+    );
+
+    let mut client = Client::builder(state.config.discord_token.expose(), intents)
+        .event_handler(handler::Handler::new(state.clone()))
         .await?;
 
-    let database_clone = database.clone();
-    let token = config.discord_token.clone();
-    tokio::spawn(async move {
-        cleanup_task(database_clone, token).await;
-    });
+    let _health_handle = ops::health::spawn(state.clone());
 
-    tracing::info!("Starting cipherbot...");
-    client.start().await?;
+    let shard_manager = client.shard_manager.clone();
 
-    Ok(())
-}
-
-async fn cleanup_task(db: Arc<db::Database>, token: String) {
-    let http = serenity::http::Http::new(&token);
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-
-    loop {
-        interval.tick().await;
-
-        let messages = match db.get_expired_messages() {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                tracing::error!("Cleanup: failed to query expired messages: {}", e);
-                continue;
+    tokio::select! {
+        result = client.start() => {
+            if let Err(error) = result {
+                tracing::error!("Gateway client stopped: {error}");
+                return Err(error.into());
             }
-        };
-
-        if messages.is_empty() {
-            continue;
         }
-
-        tracing::info!("Cleanup: deleting {} expired message(s)", messages.len());
-
-        for (msg_id, ch_id) in &messages {
-            let channel_id = ChannelId::new(*ch_id);
-
-            match channel_id.delete_message(&http, *msg_id).await {
-                Ok(_) => {
-                    tracing::debug!("Deleted message {} from channel {}", msg_id, ch_id);
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("Unknown Message")
-                        || err_str.contains("Missing Access")
-                    {
-                        tracing::debug!(
-                            "Message {} already deleted or inaccessible: {}",
-                            msg_id,
-                            err_str
-                        );
-                    } else {
-                        tracing::error!("Failed to delete message {}: {}", msg_id, err_str);
-                    }
-                }
-            }
-
-            if let Err(e) = db.remove_message(*msg_id) {
-                tracing::error!("Cleanup: failed to remove message {} from DB: {}", msg_id, e);
-            }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Shutdown signal received — draining shards");
         }
     }
+
+    shard_manager.shutdown_all().await;
+    tracing::info!("CipherBot stopped");
+    Ok(())
 }

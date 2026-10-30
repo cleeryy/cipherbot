@@ -1,11 +1,50 @@
-discord_token: ""  # can also be set via DISCORD_TOKEN env var
+# CipherBot configuration reference.
+#
+# Every key is optional. Environment variables (see .env.example) override the
+# values here, and a missing config file is fine as long as DISCORD_TOKEN is set.
+# Copy to config.yaml, or point CONFIG_PATH at a different file.
+
+# Bot token. Prefer the DISCORD_TOKEN env var so the token never sits on disk;
+# when both are set, the environment wins.
+discord_token: ""
 
 database:
-  path: "cipherbot.db"  # can also be set via DATABASE_PATH env var
+  # SQLite file. The parent directory must exist and be writable by the bot.
+  # Docker deployments use /data/cipherbot.db.
+  path: "cipherbot.db"
 
-categories:
-  # Add your Discord category IDs here
-  # Can also be set via MONITORED_CATEGORIES env var: "123456789,987654321"
-  - id: 0
-    auto_thread_links: true
-    message_ttl_hours: 24
+health:
+  # Listener for GET /healthz (JSON) and GET /metrics (Prometheus text).
+  # The server has no authentication: keep it on a private network.
+  addr: "0.0.0.0:8080"
+  # Set to false to disable; an empty HEALTH_ADDR env var also disables it.
+  enabled: true
+
+# Link curation. Channels whose parent category is listed here are curated:
+# link messages get a thread, non-link messages are forwarded to the last thread
+# and removed from the parent channel, and forwarded copies expire after
+# message_ttl_hours. Optional: an empty list disables the pipeline.
+# Env override: MONITORED_CATEGORIES="123,456" (replaces this whole list).
+#
+# To enable, replace the `categories: []` line with:
+# categories:
+#   - id: 123456789012345678
+#     auto_thread_links: true
+#     message_ttl_hours: 24
+categories: []
+
+# Optional API keys. Unset keys disable the corresponding lookups; everything
+# else keeps working. Prefer the NVD_API_KEY / VT_API_KEY / IPINFO_TOKEN env vars.
+#
+# To enable, replace the `intel: {}` line with:
+# intel:
+#   nvd_api_key: "..."    # https://nvd.nist.gov/developers/request-an-api-key
+#   vt_api_key: "..."     # https://www.virustotal.com/gui/my-apikey
+#   ipinfo_token: "..."   # https://ipinfo.io/account/token
+intel: {}
+
+features:
+  # Enables the privileged GUILD_MEMBERS intent, required for the anti-raid
+  # join gate (account age / avatar checks). Enable "Server Members Intent" in
+  # the Discord Developer Portal before turning this on.
+  member_intent: false
